@@ -1,10 +1,11 @@
 """
 """
-from collections import defaultdict
 import argparse
 from itertools import chain
+from collections import defaultdict
 from pathlib import Path
 from tqdm import tqdm
+import pandas as pd
 import yaml
 
 import torch
@@ -15,14 +16,13 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
 
-from dataset import DatasetTPC2d
+from rtid.datasets.dataset import DatasetTPC
 from networks import Encoder, Decoder
-from loss import BCAELoss
-# from runtime import runtime
+from rtid.utils.runtime import runtime
 
 
-MANIFEST_TRAIN = '/data/datasets/sphenix/highest_framedata_3d/outer/train.txt'
-MANIFEST_VALID = '/data/datasets/sphenix/highest_framedata_3d/outer/test.txt'
+MANIFEST_TRAIN = '/data/sphenix/auau/highest_framedata_3d/outer/train.txt'
+MANIFEST_VALID = '/data/sphenix/auau/highest_framedata_3d/outer/test.txt'
 
 def get_args(description):
     """
@@ -30,21 +30,19 @@ def get_args(description):
     """
     parser = argparse.ArgumentParser(description)
 
-    parser.add_argument('--clamp',
+    parser.add_argument('--transform',
                         action = 'store_true',
-                        help   = ('if used, clamp with TPC reange (64, 1023]'))
-    parser.add_argument('--clf-lambda',
-                        dest = 'clf_lambda',
-                        type = float,
-                        default = 1.,
-                        help   = ('Coefficient for classification loss '
-                                  '(default = 1.)'))
-    parser.add_argument('--clf-threshold',
-                        dest = 'clf_threshold',
-                        type = float,
-                        default = 0.5,
-                        help   = ('Threshold for classification output '
-                                  '(default = 0.5)'))
+                        help   = ('if used, does the transform'))
+    parser.add_argument('--num-encoder-layers',
+                        dest    = 'num_encoder_layers',
+                        type    = int,
+                        default = 3,
+                        help    = 'number of encoder layers (default = 3)')
+    parser.add_argument('--num-decoder-layers',
+                        dest    = 'num_decoder_layers',
+                        type    = int,
+                        default = 3,
+                        help    = 'number of decoder layers (default = 3)')
     parser.add_argument('--num-epochs',
                         dest = 'num_epochs',
                         type = int,
@@ -73,7 +71,7 @@ def get_args(description):
     parser.add_argument('--sched-gamma',
                         dest    = 'sched_gamma',
                         type    = float,
-                        default = .95,
+                        default = .9,
                         help    = ('The gamma multiplied to learning rate. '
                                    'See help for [sched-steps] for more '
                                    'information. (default = .9)'))
@@ -164,13 +162,12 @@ def run_epoch(encoder,
               optimizer=None,
               batches_per_epoch=float('inf'),
               device = 'cuda',
-              clamp = False):
+              transform = False):
     """
     """
     total = min(batches_per_epoch, len(dataloader))
     pbar = tqdm(desc = desc, total = total)
-
-    loss_sum = defaultdict(float)
+    total_loss = 0
     true, pos, true_pos = 0, 0, 0
 
     for idx, adc in enumerate(dataloader):
@@ -178,99 +175,68 @@ def run_epoch(encoder,
         if idx >= batches_per_epoch:
             break
 
-        # pad the z dimension to have length 256
-        tag = adc > 64
-
-        tag = tag.to(device)
         adc = adc.to(device)
+        tag = adc > 0
 
         code = encoder(pad(adc, (0, 7)))
-        clf_output, reg_output = decoder(code)
-        clf_output = clf_output[..., :-7]
-        reg_output = reg_output[..., :-7]
-        reg_output = torch.clamp(reg_output, max=5)
+        output = decoder(code)
+        output = output[..., :-7]
 
-        results = loss_fn(clf_output, reg_output, tag, adc)
-        loss = results.pop('loss')
+        if transform:
+            output = torch.clamp(output, max=5.08)
+            output = torch.exp(output) * 6 + 64
+
+        loss = loss_fn(output, adc)
+        total_loss += loss.item()
+
+        true += tag.sum().item()
+        pos += output.sum().item()
+        true_pos = (tag * output).sum().item()
 
         if optimizer is not None:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-        # if clamp:
-        #     # output = nn.functional.relu(output, inplace=True)
-        #     output = torch.exp(output) * 6 + 64
-
-        true += results.pop('true')
-        pos += results.pop('pos')
-        true_pos += results.pop('true pos')
-        clf_coef = results.pop('clf coef')
-
-        loss_sum['loss'] += loss.item()
-        for key, val in results.items():
-            loss_sum[key] += val
-
         pbar.update()
-        postfix = {key: val / (idx + 1) for
-                   key, val in loss_sum.items()}
-        postfix['precision'] = true_pos / pos
-        postfix['recall'] = true_pos / true
-        postfix['clf coef'] = clf_coef
-        pbar.set_postfix(postfix)
+        result = {'loss': total_loss / (idx + 1),
+                  'precision': true_pos / pos,
+                  'recall': true_pos / true,}
+        pbar.set_postfix(result)
 
-    return postfix
-
-
-class BiDecoder(nn.Module):
-    def __init__(self, in_channels, num_blocks, num_downsamples):
-        super().__init__()
-        self.decoder_clf = Decoder(in_channels,
-                                   num_blocks,
-                                   num_downsamples,
-                                   output_activ = 'sigmoid')
-        self.decoder_reg = Decoder(in_channels,
-                                   num_blocks,
-                                   num_downsamples)
-
-    def forward(self, data):
-        output_clf = self.decoder_clf(data)
-        output_reg = self.decoder_reg(data)
-        return output_clf, output_reg
+    return result
 
 
 def main():
 
     args = get_args('2d TPC Data Compression')
 
-    clamp             = args.clamp
-    clf_lambda        = args.clf_lambda
-    clf_threshold     = args.clf_threshold
-    num_epochs        = args.num_epochs
-    num_warmup_epochs = args.num_warmup_epochs
-    batch_size        = args.batch_size
-    batches_per_epoch = args.batches_per_epoch
-    sched_steps       = args.sched_steps
-    sched_gamma       = args.sched_gamma
-    device            = args.device
-    learning_rate     = args.learning_rate
-    save_frequency    = args.save_frequency
-    checkpoints       = Path(args.checkpoint_path)
+    transform          = args.transform
+    num_encoder_layers = args.num_encoder_layers
+    num_decoder_layers = args.num_decoder_layers
+    num_epochs         = args.num_epochs
+    num_warmup_epochs  = args.num_warmup_epochs
+    batch_size         = args.batch_size
+    batches_per_epoch  = args.batches_per_epoch
+    sched_steps        = args.sched_steps
+    sched_gamma        = args.sched_gamma
+    device             = args.device
+    learning_rate      = args.learning_rate
+    save_frequency     = args.save_frequency
+    checkpoints        = Path(args.checkpoint_path)
 
     # set up checkpoint folder and save config
-    # assert not checkpoints.exists()
-    checkpoints.mkdir(parents = True, exist_ok = True)
+    assert not checkpoints.exists()
+    checkpoints.mkdir(parents = True)
     with open(checkpoints/'config.yaml', 'w') as config_file:
         yaml.dump(vars(args),
                   config_file,
                   default_flow_style = False)
 
     # model and loss function
-    encoder = Encoder(16, 5, 3).to(device)
-    decoder = BiDecoder(16, 5, 3).to(device)
-    transform = lambda x : torch.exp(x) * 6 + 64.
-    # transform = None
-    loss_fn = BCAELoss(transform, clf_threshold, weight_pow = None)
+    encoder = Encoder(16, num_encoder_layers, 3).to(device)
+    decoder = Decoder(16, num_decoder_layers, 3).to(device)
+    loss_fn = nn.MSELoss()
 
     # optimizer
     params = chain(encoder.parameters(), decoder.parameters())
@@ -283,8 +249,12 @@ def main():
                             gamma = sched_gamma)
 
     # data loader
-    dataset_train = DatasetTPC2d(MANIFEST_TRAIN)
-    dataset_valid = DatasetTPC2d(MANIFEST_VALID)
+    dataset_train = DatasetTPC(MANIFEST_TRAIN,
+                               dimension = 2,
+                               axis_order = ('layer', 'azimuth', 'beam'))
+    dataset_valid = DatasetTPC(MANIFEST_VALID,
+                               dimension = 2,
+                               axis_order = ('layer', 'azimuth', 'beam'))
     dataloader_train = DataLoader(dataset_train,
                                   batch_size = batch_size,
                                   shuffle = True)
@@ -292,24 +262,29 @@ def main():
                                   batch_size = batch_size)
 
     # get dummy data for scripting
-    adc = dataset_train[0]
-    dummy_input = get_jit_input(adc, batch_size, device)
+    data = dataset_train[0]
+    dummy_input = get_jit_input(data, batch_size, device)
     with torch.no_grad():
         dummy_compr = encoder(dummy_input)
 
-    # # get inference time
-    # samples_per_second = runtime(encoder,
-    #                              input_shape = data.shape,
-    #                              batch_size = batch_size,
-    #                              num_inference_batches = 1000,
-    #                              script = True,
-    #                              device = device)
-    # print(f'samples per second = {samples_per_second: .1f}')
+    # get inference time
+    samples_per_second = runtime(encoder,
+                                 input_shape = data.shape,
+                                 batch_size = batch_size,
+                                 num_inference_batches = 1000,
+                                 script = True,
+                                 device = device)
+    print(f'samples per second = {samples_per_second: .1f}')
 
     ckpt_saver_enc = CheckpointSaver(checkpoints, save_frequency, prefix='enc')
     ckpt_saver_dec = CheckpointSaver(checkpoints, save_frequency, prefix='dec')
 
+    df_data_train = defaultdict(list)
+    df_data_valid = defaultdict(list)
     for epoch in range(1, num_epochs + 1):
+
+        current_lr = get_lr(optimizer)
+        print(f'current learning rate = {current_lr:.10f}')
 
         # train
         desc = f'Train Epoch {epoch} / {num_epochs}'
@@ -317,11 +292,11 @@ def main():
                                decoder,
                                loss_fn,
                                dataloader_train,
-                               desc = desc,
-                               optimizer = optimizer,
+                               desc              = desc,
+                               optimizer         = optimizer,
                                batches_per_epoch = batches_per_epoch,
-                               device = device,
-                               clamp = clamp)
+                               device            = device,
+                               transform         = transform)
 
         # validation
         with torch.no_grad():
@@ -330,24 +305,33 @@ def main():
                                    decoder,
                                    loss_fn,
                                    dataloader_valid,
-                                   desc = desc,
+                                   desc              = desc,
                                    batches_per_epoch = batches_per_epoch,
-                                   device = device,
-                                   clamp = clamp)
+                                   device            = device,
+                                   transform         = transform)
 
         # save checkpoints
-        ckpt_saver_enc(encoder,
-                       dummy_input,
-                       epoch,
-                       valid_stat['mse'])
-        ckpt_saver_dec(decoder,
-                       dummy_compr,
-                       epoch,
-                       valid_stat['mse'])
+        metric = valid_stat['loss']
+        ckpt_saver_enc(encoder, dummy_input, epoch, metric)
+        ckpt_saver_dec(decoder, dummy_compr, epoch, metric)
+
+        # save record
+        for key, val in train_stat.items():
+            df_data_train[key].append(val)
+        df_data_train['lr'].append(current_lr)
+        df_data_train['epoch'].append(epoch)
+
+        for key, val in valid_stat.items():
+            df_data_valid[key].append(val)
+        df_data_valid['lr'].append(current_lr)
+        df_data_valid['epoch'].append(epoch)
+
+        df_train = pd.DataFrame(data = df_data_train)
+        df_valid = pd.DataFrame(data = df_data_valid)
+        df_train.to_csv(checkpoints/'train_log.csv', index = False, float_format='%.6f')
+        df_valid.to_csv(checkpoints/'valid_log.csv', index = False, float_format='%.6f')
 
         # update learning rate
         scheduler.step()
-        current_lr = get_lr(optimizer)
-        print(f'current learning rate = {current_lr:.10f}')
 
 main()

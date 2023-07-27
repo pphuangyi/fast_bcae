@@ -5,7 +5,6 @@ from itertools import chain
 from collections import defaultdict
 from pathlib import Path
 from tqdm import tqdm
-import pandas as pd
 import yaml
 
 import torch
@@ -18,11 +17,12 @@ from torch.optim.lr_scheduler import MultiStepLR
 
 from dataset import DatasetTPC2d
 from networks import Encoder, Decoder
-from runtime import runtime
+from loss import BCAELoss
+# from runtime import runtime
 
 
-MANIFEST_TRAIN = '/data/datasets/sphenix/highest_framedata_3d/outer/train.txt'
-MANIFEST_VALID = '/data/datasets/sphenix/highest_framedata_3d/outer/test.txt'
+MANIFEST_TRAIN = '/data/sphenix/auau/highest_framedata_3d/outer/train.txt'
+MANIFEST_VALID = '/data/sphenix/auau/highest_framedata_3d/outer/test.txt'
 
 def get_args(description):
     """
@@ -43,6 +43,18 @@ def get_args(description):
                         type    = int,
                         default = 3,
                         help    = 'number of decoder layers (default = 3)')
+    parser.add_argument('--clf-lambda',
+                        dest = 'clf_lambda',
+                        type = float,
+                        default = 1.,
+                        help   = ('Coefficient for classification loss '
+                                  '(default = 1.)'))
+    parser.add_argument('--clf-threshold',
+                        dest = 'clf_threshold',
+                        type = float,
+                        default = 0.5,
+                        help   = ('Threshold for classification output '
+                                  '(default = 0.5)'))
     parser.add_argument('--num-epochs',
                         dest = 'num_epochs',
                         type = int,
@@ -71,7 +83,7 @@ def get_args(description):
     parser.add_argument('--sched-gamma',
                         dest    = 'sched_gamma',
                         type    = float,
-                        default = .9,
+                        default = .95,
                         help    = ('The gamma multiplied to learning rate. '
                                    'See help for [sched-steps] for more '
                                    'information. (default = .9)'))
@@ -162,12 +174,13 @@ def run_epoch(encoder,
               optimizer=None,
               batches_per_epoch=float('inf'),
               device = 'cuda',
-              transform = False):
+              clamp = False):
     """
     """
     total = min(batches_per_epoch, len(dataloader))
     pbar = tqdm(desc = desc, total = total)
-    total_loss = 0
+
+    loss_sum = defaultdict(float)
     true, pos, true_pos = 0, 0, 0
 
     for idx, adc in enumerate(dataloader):
@@ -175,36 +188,65 @@ def run_epoch(encoder,
         if idx >= batches_per_epoch:
             break
 
-        tag = adc > 0
+        # pad the z dimension to have length 256
+        tag = adc > 64
+
+        tag = tag.to(device)
         adc = adc.to(device)
 
         code = encoder(pad(adc, (0, 7)))
-        output = decoder(code)
-        output = output[..., :-7]
+        clf_output, reg_output = decoder(code)
+        clf_output = clf_output[..., :-7]
+        reg_output = reg_output[..., :-7]
+        reg_output = torch.clamp(reg_output, max=5)
 
-        if transform:
-            output = torch.clamp(output, max=5.08)
-            output = torch.exp(output) * 6 + 64
-
-        loss = loss_fn(output, adc)
-        total_loss += loss.item()
-
-        true += tag.sum().item()
-        pos += output.sum().item()
-        true_pos = (tag * output).sum().item()
+        results = loss_fn(clf_output, reg_output, tag, adc)
+        loss = results.pop('loss')
 
         if optimizer is not None:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-        pbar.update()
-        result = {'loss': total_loss / (idx + 1),
-                  'precision': true_pos / pos,
-                  'recall': true_pos / true,}
-        pbar.set_postfix(result)
+        # if clamp:
+        #     # output = nn.functional.relu(output, inplace=True)
+        #     output = torch.exp(output) * 6 + 64
 
-    return result
+        true += results.pop('true')
+        pos += results.pop('pos')
+        true_pos += results.pop('true pos')
+        clf_coef = results.pop('clf coef')
+
+        loss_sum['loss'] += loss.item()
+        for key, val in results.items():
+            loss_sum[key] += val
+
+        pbar.update()
+        postfix = {key: val / (idx + 1) for
+                   key, val in loss_sum.items()}
+        postfix['precision'] = true_pos / pos
+        postfix['recall'] = true_pos / true
+        postfix['clf coef'] = clf_coef
+        pbar.set_postfix(postfix)
+
+    return postfix
+
+
+class BiDecoder(nn.Module):
+    def __init__(self, in_channels, num_blocks, num_downsamples):
+        super().__init__()
+        self.decoder_clf = Decoder(in_channels,
+                                   num_blocks,
+                                   num_downsamples,
+                                   output_activ = 'sigmoid')
+        self.decoder_reg = Decoder(in_channels,
+                                   num_blocks,
+                                   num_downsamples)
+
+    def forward(self, data):
+        output_clf = self.decoder_clf(data)
+        output_reg = self.decoder_reg(data)
+        return output_clf, output_reg
 
 
 def main():
@@ -214,6 +256,8 @@ def main():
     transform          = args.transform
     num_encoder_layers = args.num_encoder_layers
     num_decoder_layers = args.num_decoder_layers
+    clf_lambda         = args.clf_lambda
+    clf_threshold      = args.clf_threshold
     num_epochs         = args.num_epochs
     num_warmup_epochs  = args.num_warmup_epochs
     batch_size         = args.batch_size
@@ -226,8 +270,8 @@ def main():
     checkpoints        = Path(args.checkpoint_path)
 
     # set up checkpoint folder and save config
-    assert not checkpoints.exists()
-    checkpoints.mkdir(parents = True)
+    # assert not checkpoints.exists()
+    checkpoints.mkdir(parents = True, exist_ok = True)
     with open(checkpoints/'config.yaml', 'w') as config_file:
         yaml.dump(vars(args),
                   config_file,
@@ -235,8 +279,10 @@ def main():
 
     # model and loss function
     encoder = Encoder(16, num_encoder_layers, 3).to(device)
-    decoder = Decoder(16, num_decoder_layers, 3).to(device)
-    loss_fn = nn.MSELoss()
+    decoder = BiDecoder(16, num_decoder_layers, 3).to(device)
+    transform = lambda x : torch.exp(x) * 6 + 64.
+    # transform = None
+    loss_fn = BCAELoss(transform, clf_threshold, weight_pow = None)
 
     # optimizer
     params = chain(encoder.parameters(), decoder.parameters())
@@ -258,29 +304,24 @@ def main():
                                   batch_size = batch_size)
 
     # get dummy data for scripting
-    data = dataset_train[0]
-    dummy_input = get_jit_input(data, batch_size, device)
+    adc = dataset_train[0]
+    dummy_input = get_jit_input(adc, batch_size, device)
     with torch.no_grad():
         dummy_compr = encoder(dummy_input)
 
-    # get inference time
-    samples_per_second = runtime(encoder,
-                                 input_shape = data.shape,
-                                 batch_size = batch_size,
-                                 num_inference_batches = 1000,
-                                 script = True,
-                                 device = device)
-    print(f'samples per second = {samples_per_second: .1f}')
+    # # get inference time
+    # samples_per_second = runtime(encoder,
+    #                              input_shape = data.shape,
+    #                              batch_size = batch_size,
+    #                              num_inference_batches = 1000,
+    #                              script = True,
+    #                              device = device)
+    # print(f'samples per second = {samples_per_second: .1f}')
 
     ckpt_saver_enc = CheckpointSaver(checkpoints, save_frequency, prefix='enc')
     ckpt_saver_dec = CheckpointSaver(checkpoints, save_frequency, prefix='dec')
 
-    df_data_train = defaultdict(list)
-    df_data_valid = defaultdict(list)
     for epoch in range(1, num_epochs + 1):
-
-        current_lr = get_lr(optimizer)
-        print(f'current learning rate = {current_lr:.10f}')
 
         # train
         desc = f'Train Epoch {epoch} / {num_epochs}'
@@ -288,11 +329,11 @@ def main():
                                decoder,
                                loss_fn,
                                dataloader_train,
-                               desc              = desc,
-                               optimizer         = optimizer,
+                               desc = desc,
+                               optimizer = optimizer,
                                batches_per_epoch = batches_per_epoch,
-                               device            = device,
-                               transform         = transform)
+                               device = device,
+                               clamp = clamp)
 
         # validation
         with torch.no_grad():
@@ -301,33 +342,24 @@ def main():
                                    decoder,
                                    loss_fn,
                                    dataloader_valid,
-                                   desc              = desc,
+                                   desc = desc,
                                    batches_per_epoch = batches_per_epoch,
-                                   device            = device,
-                                   transform         = transform)
+                                   device = device,
+                                   clamp = clamp)
 
         # save checkpoints
-        metric = valid_stat['loss']
-        ckpt_saver_enc(encoder, dummy_input, epoch, metric)
-        ckpt_saver_dec(decoder, dummy_compr, epoch, metric)
-
-        # save record
-        for key, val in train_stat.items():
-            df_data_train[key].append(val)
-        df_data_train['lr'].append(current_lr)
-        df_data_train['epoch'].append(epoch)
-
-        for key, val in valid_stat.items():
-            df_data_valid[key].append(val)
-        df_data_valid['lr'].append(current_lr)
-        df_data_valid['epoch'].append(epoch)
-
-        df_train = pd.DataFrame(data = df_data_train)
-        df_valid = pd.DataFrame(data = df_data_valid)
-        df_train.to_csv(checkpoints/'train_log.csv', index = False)
-        df_valid.to_csv(checkpoints/'valid_log.csv', index = False)
+        ckpt_saver_enc(encoder,
+                       dummy_input,
+                       epoch,
+                       valid_stat['mse'])
+        ckpt_saver_dec(decoder,
+                       dummy_compr,
+                       epoch,
+                       valid_stat['mse'])
 
         # update learning rate
         scheduler.step()
+        current_lr = get_lr(optimizer)
+        print(f'current learning rate = {current_lr:.10f}')
 
 main()
