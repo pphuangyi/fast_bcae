@@ -5,6 +5,7 @@ from itertools import chain
 from collections import defaultdict
 from pathlib import Path
 from tqdm import tqdm
+import pandas as pd
 import yaml
 
 import torch
@@ -15,10 +16,10 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
 
-from dataset import DatasetTPC2d
+from rtid.datasets.dataset import DatasetTPC
 from networks import Encoder, Decoder
 from loss import BCAELoss
-# from runtime import runtime
+from rtid.utils.runtime import runtime
 
 
 MANIFEST_TRAIN = '/data/sphenix/auau/highest_framedata_3d/outer/train.txt'
@@ -174,7 +175,7 @@ def run_epoch(encoder,
               optimizer=None,
               batches_per_epoch=float('inf'),
               device = 'cuda',
-              clamp = False):
+              transform = False):
     """
     """
     total = min(batches_per_epoch, len(dataloader))
@@ -189,7 +190,7 @@ def run_epoch(encoder,
             break
 
         # pad the z dimension to have length 256
-        tag = adc > 64
+        tag = adc > 0
 
         tag = tag.to(device)
         adc = adc.to(device)
@@ -198,7 +199,10 @@ def run_epoch(encoder,
         clf_output, reg_output = decoder(code)
         clf_output = clf_output[..., :-7]
         reg_output = reg_output[..., :-7]
-        reg_output = torch.clamp(reg_output, max=5)
+
+        if transform:
+            reg_output = torch.clamp(reg_output, max = 5.08)
+            reg_output = torch.exp(reg_output) * 6 + 64
 
         results = loss_fn(clf_output, reg_output, tag, adc)
         loss = results.pop('loss')
@@ -208,9 +212,6 @@ def run_epoch(encoder,
             loss.backward()
             optimizer.step()
 
-        # if clamp:
-        #     # output = nn.functional.relu(output, inplace=True)
-        #     output = torch.exp(output) * 6 + 64
 
         true += results.pop('true')
         pos += results.pop('pos')
@@ -280,13 +281,12 @@ def main():
     # model and loss function
     encoder = Encoder(16, num_encoder_layers, 3).to(device)
     decoder = BiDecoder(16, num_decoder_layers, 3).to(device)
-    transform = lambda x : torch.exp(x) * 6 + 64.
     # transform = None
-    loss_fn = BCAELoss(transform, clf_threshold, weight_pow = None)
+    loss_fn = BCAELoss(clf_threshold)
 
     # optimizer
     params = chain(encoder.parameters(), decoder.parameters())
-    optimizer = AdamW(params, lr=learning_rate)
+    optimizer = AdamW(params, lr = learning_rate)
 
     # schedular
     milestones = range(num_warmup_epochs, num_epochs, sched_steps)
@@ -295,8 +295,12 @@ def main():
                             gamma = sched_gamma)
 
     # data loader
-    dataset_train = DatasetTPC2d(MANIFEST_TRAIN)
-    dataset_valid = DatasetTPC2d(MANIFEST_VALID)
+    dataset_train = DatasetTPC(MANIFEST_TRAIN,
+                               dimension = 2,
+                               axis_order = ('layer', 'azimuth', 'beam'))
+    dataset_valid = DatasetTPC(MANIFEST_VALID,
+                               dimension = 2,
+                               axis_order = ('layer', 'azimuth', 'beam'))
     dataloader_train = DataLoader(dataset_train,
                                   batch_size = batch_size,
                                   shuffle = True)
@@ -304,24 +308,29 @@ def main():
                                   batch_size = batch_size)
 
     # get dummy data for scripting
-    adc = dataset_train[0]
-    dummy_input = get_jit_input(adc, batch_size, device)
+    data = dataset_train[0]
+    dummy_input = get_jit_input(data, batch_size, device)
     with torch.no_grad():
         dummy_compr = encoder(dummy_input)
 
-    # # get inference time
-    # samples_per_second = runtime(encoder,
-    #                              input_shape = data.shape,
-    #                              batch_size = batch_size,
-    #                              num_inference_batches = 1000,
-    #                              script = True,
-    #                              device = device)
-    # print(f'samples per second = {samples_per_second: .1f}')
+    # get inference time
+    samples_per_second = runtime(encoder,
+                                 input_shape = data.shape,
+                                 batch_size = batch_size,
+                                 num_inference_batches = 1000,
+                                 script = True,
+                                 device = device)
+    print(f'samples per second = {samples_per_second: .1f}')
 
     ckpt_saver_enc = CheckpointSaver(checkpoints, save_frequency, prefix='enc')
     ckpt_saver_dec = CheckpointSaver(checkpoints, save_frequency, prefix='dec')
 
+    df_data_train = defaultdict(list)
+    df_data_valid = defaultdict(list)
     for epoch in range(1, num_epochs + 1):
+
+        current_lr = get_lr(optimizer)
+        print(f'current learning rate = {current_lr:.10f}')
 
         # train
         desc = f'Train Epoch {epoch} / {num_epochs}'
@@ -329,11 +338,11 @@ def main():
                                decoder,
                                loss_fn,
                                dataloader_train,
-                               desc = desc,
-                               optimizer = optimizer,
+                               desc              = desc,
+                               optimizer         = optimizer,
                                batches_per_epoch = batches_per_epoch,
-                               device = device,
-                               clamp = clamp)
+                               device            = device,
+                               transform         = transform)
 
         # validation
         with torch.no_grad():
@@ -342,10 +351,10 @@ def main():
                                    decoder,
                                    loss_fn,
                                    dataloader_valid,
-                                   desc = desc,
+                                   desc              = desc,
                                    batches_per_epoch = batches_per_epoch,
-                                   device = device,
-                                   clamp = clamp)
+                                   device            = device,
+                                   transform         = transform)
 
         # save checkpoints
         ckpt_saver_enc(encoder,
@@ -357,9 +366,23 @@ def main():
                        epoch,
                        valid_stat['mse'])
 
+        # save record
+        for key, val in train_stat.items():
+            df_data_train[key].append(val)
+        df_data_train['lr'].append(current_lr)
+        df_data_train['epoch'].append(epoch)
+
+        for key, val in valid_stat.items():
+            df_data_valid[key].append(val)
+        df_data_valid['lr'].append(current_lr)
+        df_data_valid['epoch'].append(epoch)
+
+        df_train = pd.DataFrame(data = df_data_train)
+        df_valid = pd.DataFrame(data = df_data_valid)
+        df_train.to_csv(checkpoints/'train_log.csv', index = False, float_format='%.6f')
+        df_valid.to_csv(checkpoints/'valid_log.csv', index = False, float_format='%.6f')
+
         # update learning rate
         scheduler.step()
-        current_lr = get_lr(optimizer)
-        print(f'current learning rate = {current_lr:.10f}')
 
 main()

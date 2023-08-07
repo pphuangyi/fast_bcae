@@ -189,9 +189,10 @@ def run_epoch(encoder,
         loss = loss_fn(output, adc)
         total_loss += loss.item()
 
-        true += tag.sum().item()
-        pos += output.sum().item()
-        true_pos = (tag * output).sum().item()
+        with torch.no_grad():
+            true += tag.sum().item()
+            pos += (output > 0).sum().item()
+            true_pos = (tag * (output > 0)).sum().item()
 
         if optimizer is not None:
             optimizer.zero_grad()

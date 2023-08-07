@@ -65,20 +65,14 @@ class BCAELoss(nn.Module):
 
     # pylint: disable=too-many-arguments
     def __init__(self,
-                 transform  = None,
                  threshold  = .5,
                  gamma      = 2,
                  eps        = 1e-8,
-                 weight_pow = .1):
+                 weight_pow = None):
         """
         Initialize the parameters
         """
         super().__init__()
-
-        if transform is None:
-            self.transform = nn.Identity()
-        else:
-            self.transform = transform
 
         self.threshold = threshold
 
@@ -111,7 +105,7 @@ class BCAELoss(nn.Module):
         """
 
         mask = clf_output > self.threshold
-        combined = self.transform(reg_output) * mask
+        combined = reg_output * mask
 
         with torch.no_grad():
             pos = mask.sum()
@@ -126,7 +120,7 @@ class BCAELoss(nn.Module):
         # update the coefficient for classification loss
         self.clf_coef = ( self.expo * self.clf_coef
                           + (loss_reg / loss_clf).item() ) / (self.expo + 1.)
-        self.clf_coef = min(self.clf_coef, 10)
+        # self.clf_coef = min(self.clf_coef, 10)
 
         # save all type of losses to a dictionary
         losses = {'loss': loss_reg + self.clf_coef * loss_clf,
