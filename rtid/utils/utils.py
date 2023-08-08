@@ -1,6 +1,7 @@
 """
 """
 import copy
+
 import torch
 from torch import nn
 
@@ -33,7 +34,7 @@ def get_norm_layer(norm, features):
     if name == 'instance':
         return nn.InstanceNorm3d(features, **kwargs)
 
-    raise ValueError("Unknown Layer: '%s'" % name)
+    raise ValueError(f"Unknown Layer: {name}")
 
 
 def get_activ_layer(activ):
@@ -57,5 +58,22 @@ def get_activ_layer(activ):
     if name == 'sigmoid':
         return nn.Sigmoid()
 
-    raise ValueError("Unknown activation: '%s'" % name)
+    raise ValueError(f"Unknown activation: {name}")
 
+
+def get_jit_input(tensor, batch_size, device):
+    """
+    Get a dummy input for jit tracing
+    """
+    dummy = torch.ones_like(tensor)
+    shape = (batch_size, ) + (1, ) * tensor.dim()
+    dummy = dummy.repeat(shape)
+    return dummy.to(device)
+
+
+def get_lr(optim):
+    """
+    Get the current learning rate
+    """
+    for param_group in optim.param_groups:
+        return param_group['lr']
