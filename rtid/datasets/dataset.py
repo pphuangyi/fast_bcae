@@ -1,7 +1,7 @@
 """
 Load Au + Au TPC data
 """
-
+from pathlib import Path
 import numpy as np
 
 import torch
@@ -18,8 +18,9 @@ class DatasetTPC(Dataset):
     Load TPC data as multi-channel 2d dataset
     """
     def __init__(self,
-                 manifest,
-                 dimension = 2,
+                 dataroot,
+                 split      = 'train',
+                 dimension  = 2,
                  axis_order = ('azimuth', 'beam', 'layer')):
         """
         Input
@@ -29,8 +30,15 @@ class DatasetTPC(Dataset):
         """
         super().__init__()
 
+        dataroot = Path(dataroot)
+        assert dataroot.exists(), f'{dataroot} does not exist!'
+
+        manifest = dataroot/f'{split}.txt'
+        assert manifest.exists(), f'{manifest} does not exist!'
+
         with open(manifest, 'r') as file_handle:
-            self.fnames = file_handle.read().splitlines()
+            fnames = file_handle.read().splitlines()
+        self.fnames = [dataroot/fname for fname in fnames]
 
         assert set(axis_order) == AXIS_MAP.keys()
         if tuple(axis_order) != DEFAULT_ORDER:
@@ -60,12 +68,11 @@ class DatasetTPC(Dataset):
 
 # from pathlib import Path
 #
-# ROOT = Path('/data/sphenix/auau/highest_split_3d/outer')
+# ROOT = Path('/data/yhuang2/sphenix/auau/highest_framedata_3d/outer')
 # def test():
 #
-#     for split in ('train', 'valid'):
-#         manifest = ROOT/f'{split}.txt'
-#         dataset = DatasetTPC(manifest, dimension=3)
+#     for split in ('train', 'test'):
+#         dataset = DatasetTPC(ROOT, split, dimension=3)
 #         print(f'The {split} dataset contains {len(dataset)} samples.')
 #         for data in dataset:
 #             print(data.shape)

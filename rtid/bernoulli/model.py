@@ -65,7 +65,9 @@ class Conv3dBlock(nn.Conv3d):
 
 
 class ProbPredictor(nn.Module):
-    def __init__(self, norm, activ)
+    def __init__(self, norm, activ):
+
+        super().__init__()
 
         layer = partial(SparseConv3d, norm = norm, activ = activ)
 
@@ -92,6 +94,8 @@ class ProbPredictor(nn.Module):
 
 class Decoder(nn.Module):
     def __init__(self, norm, activ):
+
+        super().__init__()
 
         layer = partial(Conv3dBlock, norm = norm, activ = activ)
 
