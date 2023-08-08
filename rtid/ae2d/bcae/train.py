@@ -1,5 +1,8 @@
 """
 """
+import os
+os.environ['CUDA_DEVICE_ORDER'] = "PCI_BUS_ID"
+
 import argparse
 from itertools import chain
 from collections import defaultdict
@@ -17,13 +20,15 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
 
 from rtid.datasets.dataset import DatasetTPC
+from rtid.utils.runtime import runtime
+from rtid.utils.utils import get_lr, get_jit_input
+from rtid.utils.checkpoint_saver import CheckpointSaver
+
 from networks import Encoder, Decoder
 from loss import BCAELoss
-from rtid.utils.runtime import runtime
 
 
-MANIFEST_TRAIN = '/data/sphenix/auau/highest_framedata_3d/outer/train.txt'
-MANIFEST_VALID = '/data/sphenix/auau/highest_framedata_3d/outer/test.txt'
+DATA_ROOT = Path('/data/yhuang2/sphenix/auau/highest_framedata_3d/outer/')
 
 def get_args(description):
     """
@@ -87,12 +92,18 @@ def get_args(description):
                         default = .95,
                         help    = ('The gamma multiplied to learning rate. '
                                    'See help for [sched-steps] for more '
-                                   'information. (default = .9)'))
+                                   'information. (default = .95)'))
     parser.add_argument('--device',
                         type    = str,
                         default = 'cuda',
                         choices = ('cuda', 'cpu'),
                         help    = ('device (default = cuda)'))
+    parser.add_argument('--gpu-id',
+                        dest    = 'gpu_id',
+                        type    = int,
+                        default = 0,
+                        help    = ('ID of GPU card. Only effective when '
+                                   'device is cuda (default = 0)'))
     parser.add_argument('--batch-size',
                         dest    = 'batch_size',
                         type    = int,
@@ -117,54 +128,6 @@ def get_args(description):
                                    '(default = ./checkpoints)'))
 
     return parser.parse_args()
-
-
-def get_jit_input(tensor, batch_size, device):
-    """
-    Get a dummy input for jit tracing
-    """
-    dummy = torch.ones_like(tensor)
-    shape = (batch_size, ) + (1, ) * tensor.dim()
-    dummy = dummy.repeat(shape)
-    return dummy.to(device)
-
-
-def get_lr(optim):
-    """
-    Get the current learning rate
-    """
-    for param_group in optim.param_groups:
-        return param_group['lr']
-
-
-class CheckpointSaver:
-    def __init__(self,
-                 checkpoint_path,
-                 frequency = -1,
-                 benchmark = float('inf'),
-                 prefix = 'mod'):
-
-        self.checkpoint_path = Path(checkpoint_path)
-        self.frequency = frequency
-        self.benchmark = benchmark
-        self.prefix = prefix
-
-    def __call__(self, model, data, epoch, metric):
-
-        traced_model = trace(model, data)
-
-        name = self.checkpoint_path/f'{self.prefix}_last.pth'
-        save(traced_model, name)
-
-        if self.frequency > 0:
-            if epoch % self.frequency == 0:
-                name = self.checkpoint_path/f'{self.prefix}_{epoch}.pth'
-                save(traced_model, name)
-
-        if metric < self.benchmark:
-            self.benchmark = metric
-            name = self.checkpoint_path/f'{self.prefix}_best.pth'
-            save(traced_model, name)
 
 
 def run_epoch(encoder,
@@ -254,19 +217,27 @@ def main():
 
     args = get_args('2d TPC Data Compression')
 
+    # model specific parameters
     transform          = args.transform
     num_encoder_layers = args.num_encoder_layers
     num_decoder_layers = args.num_decoder_layers
     clf_lambda         = args.clf_lambda
     clf_threshold      = args.clf_threshold
+
+    # training device
+    device             = args.device
+    gpu_id             = args.gpu_id
+    if device == 'cuda':
+        device = f'{device}:{gpu_id}'
+
+    # training and model saving parameters
     num_epochs         = args.num_epochs
     num_warmup_epochs  = args.num_warmup_epochs
     batch_size         = args.batch_size
     batches_per_epoch  = args.batches_per_epoch
+    learning_rate      = args.learning_rate
     sched_steps        = args.sched_steps
     sched_gamma        = args.sched_gamma
-    device             = args.device
-    learning_rate      = args.learning_rate
     save_frequency     = args.save_frequency
     checkpoints        = Path(args.checkpoint_path)
 
@@ -295,11 +266,9 @@ def main():
                             gamma = sched_gamma)
 
     # data loader
-    dataset_train = DatasetTPC(MANIFEST_TRAIN,
-                               dimension = 2,
+    dataset_train = DatasetTPC(DATA_ROOT, split = 'train', dimension = 2,
                                axis_order = ('layer', 'azimuth', 'beam'))
-    dataset_valid = DatasetTPC(MANIFEST_VALID,
-                               dimension = 2,
+    dataset_valid = DatasetTPC(DATA_ROOT, split = 'test',  dimension = 2,
                                axis_order = ('layer', 'azimuth', 'beam'))
     dataloader_train = DataLoader(dataset_train,
                                   batch_size = batch_size,
