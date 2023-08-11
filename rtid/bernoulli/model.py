@@ -70,6 +70,7 @@ class ProbPredictor(nn.Module):
         super().__init__()
 
         layer = partial(SparseConv3d, norm = norm, activ = activ)
+        # layer = partial(Conv3dBlock, norm = norm, activ = activ)
 
         self.model = nn.ModuleList([
             layer(1, 2, kernel_size = 3, padding = 1),
@@ -77,6 +78,7 @@ class ProbPredictor(nn.Module):
             layer(2, 2, kernel_size = 3, padding = 1),
             layer(2, 2, kernel_size = 3, padding = 2, dilation = 2),
             SparseConv3d(2, 1, kernel_size = 1, norm = None, activ = 'sigmoid')
+            # Conv3dBlock(2, 1, kernel_size = 1, norm = None, activ = 'sigmoid')
         ])
 
     def forward(self, data, mask = None):
@@ -90,6 +92,11 @@ class ProbPredictor(nn.Module):
             prob = layer(prob, mask)
 
         return prob
+
+        # for layer in self.model:
+        #     prob = layer(prob)
+
+        # return prob * mask
 
 
 class Decoder(nn.Module):
@@ -159,6 +166,8 @@ class Model(nn.Module):
 
         result = {'prob': prob, 'gate': gate, 'reco': reco}
 
+        # Computate the hard gate (step function) and
+        # the reconstruction with the hard gate
         if return_hard:
             gate_hard = logit_dff > 0
 
