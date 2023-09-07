@@ -19,7 +19,7 @@ def extract_name_kwargs(obj):
     return (name, kwargs)
 
 
-def get_norm_layer(norm, features):
+def get_norm_layer3d(norm, features):
     name, kwargs = extract_name_kwargs(norm)
 
     if name is None:
@@ -33,6 +33,24 @@ def get_norm_layer(norm, features):
 
     if name == 'instance':
         return nn.InstanceNorm3d(features, **kwargs)
+
+    raise ValueError(f"Unknown Layer: {name}")
+
+
+def get_norm_layer2d(norm, features):
+    name, kwargs = extract_name_kwargs(norm)
+
+    if name is None:
+        return nn.Identity(**kwargs)
+
+    if name == 'layer':
+        return nn.LayerNorm((features,), **kwargs)
+
+    if name == 'batch':
+        return nn.BatchNorm2d(features, **kwargs)
+
+    if name == 'instance':
+        return nn.InstanceNorm2d(features, **kwargs)
 
     raise ValueError(f"Unknown Layer: {name}")
 
