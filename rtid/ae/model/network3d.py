@@ -189,6 +189,7 @@ class Encoder(nn.Module):
                  in_channels    = 1,
                  out_channels   = CODE_CHANNELS,
                  conv_args_list = CONV_ARGS_LIST,
+                 conv_features  = None,
                  norm           = None,
                  activ          = {'name'           : 'leakyrelu',
                                    'negative_slope' : .2},
@@ -201,6 +202,10 @@ class Encoder(nn.Module):
         in_ch = in_channels
 
         for idx, conv_args in enumerate(conv_args_list):
+
+            if conv_features is not None:
+                conv_args['out_channels'] = conv_features[idx]
+
             conv_args['in_channels'] = in_ch
 
             layer = encoder_block(conv_args, norm, activ, rezero = rezero)
