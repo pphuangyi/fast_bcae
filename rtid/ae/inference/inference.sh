@@ -24,15 +24,15 @@ do
 
     fname="${folder}/inference_speed_${gpu_id}_${model_type}_${precision}.csv"
     if [ -f "$fname" ]; then
-        echo "save results to ${fname}"
+        echo "Append results to ${fname}"
     else
         touch $fname
+        echo "Save results to ${fname}"
         echo "batch_size,frames_per_second" > $fname
     fi
 
     prefix="python inference.py --script --gpu-id ${gpu_id} --model-type ${model_type} --half-mode ${half_mode}"
-    # for bs in 1 2 4 8 16 32 48 64 80 96 112 128
-    for bs in 144 196 256
+    for bs in 1 2 4 8 16 32 48 64 80 96 112 128 144 196 256
     do
         cmd="${prefix} --batch-size ${bs}"
         echo $cmd
