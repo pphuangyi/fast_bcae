@@ -1,5 +1,15 @@
 gpu_id=$1
-model_type=$2
+machine=$2
+model_type=$3
+
+folder="inference_speed_results/inference_speed_${machine}"
+
+if [ -d "$folder" ]; then
+    echo "folder $folder already exists."
+else
+    mkdir -p "$folder"
+fi
+
 
 for precision in full half
 do
@@ -12,12 +22,17 @@ do
         exit 1
     fi
 
-    fname="inference_speed_results/inference_speed_${gpu_id}_${model_type}_${precision}.csv"
-    touch $fname
-    echo "batch_size,frames_per_second" > $fname
+    fname="${folder}/inference_speed_${gpu_id}_${model_type}_${precision}.csv"
+    if [ -f "$fname" ]; then
+        echo "save results to ${fname}"
+    else
+        touch $fname
+        echo "batch_size,frames_per_second" > $fname
+    fi
 
     prefix="python inference.py --script --gpu-id ${gpu_id} --model-type ${model_type} --half-mode ${half_mode}"
-    for bs in 1 2 4 8 16 32 48 64 80 96 112 128
+    # for bs in 1 2 4 8 16 32 48 64 80 96 112 128
+    for bs in 144 196 256
     do
         cmd="${prefix} --batch-size ${bs}"
         echo $cmd
