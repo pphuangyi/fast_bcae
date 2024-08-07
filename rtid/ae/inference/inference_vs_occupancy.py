@@ -43,17 +43,6 @@ def get_args(description):
                         type    = int,
                         default = 4,
                         help    = 'batch size, (default = 4)')
-    parser.add_argument('--half-mode',
-                        dest    = 'half_mode',
-                        default = None,
-                        choices = ('none', 'tensor', 'autocast'),
-                        help    = ('how to run in half precision.\n'
-                                   "- input 'none' or omitting the flag: "
-                                   "use full precision\n"
-                                   "- 'tensor': halve the model weight and "
-                                   "the input data direcly\n"
-                                   "- 'autocast': use "
-                                   "'torch.cuda.amp.autocast'"))
     parser.add_argument('--num-batches',
                         dest    = 'num_batches',
                         type    = int,
@@ -133,12 +122,6 @@ def main():
     else:
         raise TypeError(f'unknow model type: {model_type}')
 
-
-    # if model_type.startswith('3d'):
-    #     input_shape = torch.Size([1, 16, 192, 256])
-    # else:
-    #     input_shape = torch.Size([16, 192, 256])
-
     encoder = torch.compile(encoder)
 
     encoder.eval()
@@ -151,14 +134,11 @@ def main():
     pbar = tqdm(dataset, desc='inference', total=len(dataset))
     for data in pbar:
 
-
         data = pad(data, (0, 7)).to(device)
         occupancy = (data > 0).sum().item() / size
 
         repeat_shape = (batch_size, ) + (1, ) * data.dim()
         batch = data.repeat(repeat_shape)
-
-        # batch = torch.randn((batch_size, ) + input_shape).to(device)
 
         results = []
         @perf(o = results, n = num_batches, w = num_warmup_batches)
@@ -166,21 +146,7 @@ def main():
             encoder(batch)
 
         with torch.no_grad():
-            if half_mode is None or half_mode == 'none':
-                # Use full precision
-                run(encoder, batch)
-
-            elif half_mode == 'autocast':
-                # Use autocast
-                assert 'cuda' in device
-                with torch.cuda.amp.autocast():
-                    run(encoder, batch)
-
-            elif half_mode == 'tensor':
-                # Use half precision
-                encoder = encoder.half()
-                data = data.half()
-                run(encoder, batch)
+            run(encoder, batch)
 
         total_time = sum(results) / 1000.
         total_frames = num_batches * batch_size
@@ -196,7 +162,7 @@ def main():
         pbar.update()
 
     df = pd.DataFrame(data=stats)
-    fname = f'model_{model_type}-bs_{batch_size}-gpu_{gpu_name}_random.csv'
+    fname = f'model_{model_type}-bs_{batch_size}-gpu_{gpu_name}.csv'
     df.to_csv(RESULT_PATH/fname, index = False, float_format='%.6f')
 
 
