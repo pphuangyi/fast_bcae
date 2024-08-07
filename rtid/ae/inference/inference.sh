@@ -15,8 +15,10 @@ for precision in full half
 do
     if [ "${precision}" == "full" ]; then
         half_mode="none"
+        comp="compiled"
     elif [ "${precision}" == "half" ]; then
         half_mode="tensor"
+        comp="scripted"
     else
         echo "Wrong precision"
         exit 1
@@ -31,7 +33,7 @@ do
         echo "batch_size,frames_per_second" > $fname
     fi
 
-    prefix="python inference.py --script --gpu-id ${gpu_id} --model-type ${model_type} --half-mode ${half_mode}"
+    prefix="python inference.py --${comp} --gpu-id ${gpu_id} --model-type ${model_type} --half-mode ${half_mode}"
     for bs in 1 2 4 8 16 32 48 64 80 96 112 128 144 196 256
     do
         cmd="${prefix} --batch-size ${bs}"

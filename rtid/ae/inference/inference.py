@@ -34,9 +34,12 @@ def get_args(description):
                         type    = int,
                         default = 4,
                         help    = 'batch size, (default = 4)')
-    parser.add_argument('--script',
+    parser.add_argument('--scripted',
                         action = 'store_true',
                         help   = 'whether to script the model')
+    parser.add_argument('--compiled',
+                        action = 'store_true',
+                        help   = 'whether to compile the model')
     parser.add_argument('--half-mode',
                         dest    = 'half_mode',
                         default = None,
@@ -79,10 +82,17 @@ def main():
 
     model_type         = args.model_type
     batch_size         = args.batch_size
-    script             = args.script
+    scripted           = args.scripted
+    compiled           = args.compiled
     half_mode          = args.half_mode
     num_batches        = args.num_batches
     num_warmup_batches = args.num_warmup_batches
+
+    if half_mode == 'tensor':
+        assert not compiled, \
+            "cannot cast compiled model to half"
+    assert not (scripted and compiled), \
+        "don't compile and script at the same time"
 
     device = args.device
     if device == 'cuda':
@@ -114,8 +124,11 @@ def main():
     with torch.no_grad():
         if half_mode is None or half_mode == 'none':
             # Use full precision
-            if script:
+            if scripted:
                 encoder = trace(encoder, data)
+
+            if compiled:
+                encoder = torch.compile(encoder)
 
             run(encoder, data)
 
@@ -123,8 +136,12 @@ def main():
 
             assert 'cuda' in device
             # Use autocast
-            if script:
+            if scripted:
                 encoder = trace(encoder, data)
+
+            if compiled:
+                encoder = torch.compile(encoder)
+
             with torch.cuda.amp.autocast():
                 run(encoder, data)
 
@@ -132,7 +149,7 @@ def main():
             # Use half precision
             encoder = encoder.half()
             data = data.half()
-            if script:
+            if scripted:
                 encoder = trace(encoder, data)
             run(encoder, data)
 
